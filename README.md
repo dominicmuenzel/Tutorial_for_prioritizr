@@ -1,2 +1,1 @@
-
- [View the rendered tutorial](https://github.com/dominicmuenzel/Tutorial_for_prioritizr/)
+📖 [View the rendered tutorial](https://dominicmuenzel.github.io/Tutorial_for_prioritizr/)
