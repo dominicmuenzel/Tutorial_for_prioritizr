@@ -1,0 +1,842 @@
+---
+title: "prioritizr tutorial"
+author: "Dominic Muenzel (dm710@kent.ac.uk)"
+date: "2023-06-07"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+<br>
+
+# Introduction
+
+This is an R Markdown tutorial on using *prioritizr* https://prioritizr.net/ to perform spatial conservation planning.
+
+Prioritizr supports a broad range of objectives, constraints, and penalties allowing you to answer custom-tailored conservation planning exercises.
+
+Features it can incorporate include multiple management zones, structural connectivity, functional connectivity, physical contiguity, partial selection of areas, and many others described below.
+
+The algorithm solvers provide optimal solutions (whereas tools such as Marxan generate near-optimal solutions), and are orders of magnitude faster if using the commercial Gurobi solver https://www.gurobi.com/ which anyone with an academic e-mail can get for free.
+
+
+<br>
+
+# 1. Importing libraries
+
+```{r, warning=FALSE,message=FALSE}
+library(dplyr)
+library(tidyr)
+library(sf)
+library(terra)
+library(geodata)
+library(prioritizr)
+library(plotfunctions)
+library(RColorBrewer)
+library(classInt)
+```
+<br>
+
+# 2. Setting up study area and planning unit grid
+
+In this example, our planning region will be Aceh, Indonesia. This file can be found [here](https://github.com/dominicmuenzel/Prioritizr-rmarkdown/blob/main/study_area_utm.zip).
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide'}
+
+unzip("study_area_utm.zip")
+study_area_utm <- read_sf(dsn = ".", layer = "study_area_utm" )
+
+# bounding box of the study area - used throughout for positioning text/legends
+# on plots (this replaces the old `ext(study_area_utm)` calls, since `ext()`
+# is a terra function that doesn't work on sf objects)
+bb <- st_bbox(study_area_utm)
+
+```
+<br>
+
+Next, we will create a hexagonal planning unit grid. A planning unit is a spatial management unit which is either selected or not selected in a solution.
+
+The code below is adapted from a M. Strimas Mackey [tutorial](https://strimas.com/post/hexagonal-grids/#:~:text=Creating%20grids-,Hexagonal%20grids,grid%20of%20polygons%20with%20HexPoints2SpatialPolygons%20.). If you check out the link you can read about the benefits and drawbacks of hexagonal vs square planning units.
+
+
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE}
+# this function generates a planning unit grid. 'x' is a projected sf object of the region. 'type' is either square or hexagonal. 'cell_width' or 'cell_area' is supplied in units of the projection. 'clip' determines whether the grid is clipped (TRUE) or not (FALSE) to the region
+make_grid <- function(x, type, cell_width, cell_area, clip = FALSE) {
+  if (!type %in% c("square", "hexagonal")) {
+    stop("Type must be either 'square' or 'hexagonal'")
+  }
+
+  if (missing(cell_width)) {
+    if (missing(cell_area)) {
+      stop("Must provide cell_width or cell_area")
+    } else {
+      if (type == "square") {
+        cell_width <- sqrt(cell_area)
+      } else if (type == "hexagonal") {
+        cell_width <- sqrt(2 * cell_area / sqrt(3))
+      }
+    }
+  }
+  # generate grid over the (buffered) extent of the study area
+  g <- st_make_grid(x, cellsize = cell_width, square = (type == "square"), what = "polygons")
+  g <- st_sf(ID = as.character(seq_along(g)), geometry = g)
+  st_crs(g) <- st_crs(x)
+
+  # clip to boundary of study area
+  if (clip) {
+    g <- st_intersection(g, st_union(x))
+  } else {
+    # keep only cells that intersect the study area
+    g <- g[st_union(x), ]
+  }
+  # clean up feature IDs
+  g$ID <- as.character(seq_len(nrow(g)))
+
+  # Calculate the area for each polygon
+  g$area <- as.numeric(st_area(g))
+
+  return(g)
+}
+
+# make a 100km2 hexagonal grid clipped to Aceh. Note that because the CRS is in meters, the cell area is in meters squared.
+hex_grid<-make_grid(x=study_area_utm, type = "hexagonal", cell_area = 100000000, clip = TRUE)
+
+# plot the Aceh shapefile and planning unit grid
+plot(st_geometry(study_area_utm), col = "grey50", bg = "light blue", axes = TRUE)
+text(bb["xmax"], bb["ymax"]*.99, paste0("Study Area:\n", study_area_utm$NAME_1))
+plot(st_geometry(hex_grid), border = "orange", add = TRUE)
+
+```
+<br>
+
+We can see that the planning unit grid has a data frame containing IDs and areas (in m^2^). Planning units should have unique IDs.
+
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE}
+head(hex_grid)
+```
+<br>
+
+In this case our planning unit grid is a shapefile, but *prioritizr* also accepts raster file planning unit grids.
+
+<br>
+
+# 3. Preparing conservation features
+
+Now we will import some example conservation feature data.
+
+'animals.zip' contains the species ranges for nine species of terrestrial mammals from the IUCN Red List database and can be found [here](https://github.com/dominicmuenzel/Prioritizr-rmarkdown/blob/main/animals.zip).
+
+Conservation features can also be habitat types, ecosystem services, or landscape metrics (e.g. connectivity). They can be presence-absence or continuous data. There is no limit as to how many conservation features can be included in a problem.
+
+There may be cases where it makes sense to discretise continuous features into bins, e.g. high, medium, low.
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide'}
+
+unzip("animals.zip")
+animals <- read_sf(dsn = ".", layer = "animals" )
+animals <- st_transform(animals, st_crs(hex_grid))
+plot(st_geometry(animals))
+```
+<br>
+
+We need to calculate how much of each conservation feature is contained within each planning unit. In ArcGIS this can be done with the **tabulate intersection** tool.
+```{r, warning=FALSE,message=FALSE,eval=TRUE}
+
+# intersect grid with features
+i <- st_intersection(hex_grid, animals)
+
+# compute area
+i$area <- as.numeric(st_area(i))
+
+# get the attribute table
+d <- st_drop_geometry(i)
+
+# aggregate and sum the areas
+m <- aggregate(d[, 'area', drop=FALSE], d[, c('ID', 'binomial')], sum)
+
+```
+<br>
+
+Next we want to create three sets of data frames.
+
+  * **puDF** describes the planning units and has two columns:
+    + planning unit IDs
+    + planning unit areas
+  * **featuresDF** describes the conservation features and has two columns:
+    + conservation features IDs
+    + conservation features names
+  * **rijDF** gives how much of each conservation feature is in each planning unit and has three columns:
+    + planning unit IDs
+    + conservation features IDs
+    + amount of conservation feature in the planning unit
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE}
+
+#Area of planning units changed to km2 instead of m2, as prioritizr will give a warning message if values are too high
+puDF<-data.frame("id"=as.numeric(hex_grid$ID),"cost"=hex_grid$area/1e6)
+
+
+featuresDF<-data.frame("id"=as.numeric(as.factor(sort(unique(m$binomial))
+)),"name"=sort(unique(m$binomial)))
+
+#Area of conservation features in planning units changed to km2 instead of m2, as prioritizr will give a warning message if values are too high
+rijDF<-data.frame("pu"=as.numeric(m$ID),"species"=featuresDF$id[match(m$binomial,featuresDF$name)],"amount"=m$area/1e6)
+```
+<br>
+
+# 4. Running prioritisation
+
+## 4.1. Minimum set objective
+
+In this first scenario, we use a **minimum set objective**, which means we seek to minimise the cost of the solution (similar to Marxan). We set a target to protect 30% of nine species ranges.
+
+As the cost, we use the area of the planning units. If we had other cost layers, we could use these instead. Examples include land acquisition costs, management costs, restoration costs, accessibility costs, and opportunity costs.
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide'}
+
+#Create the prioritizr problem
+p1 <- problem(puDF, featuresDF, cost_column = "cost",rij = rijDF) %>%
+
+  #Add minimum set objective
+  add_min_set_objective() %>%
+
+  #Add relative targets, 30% target for all species ranges
+  add_relative_targets(rep(0.3,nrow(featuresDF))) %>%
+
+  #Add the default solver, a gap of 0 means find the optimal solution, a gap of 0.1 means find a solution within 10% optimality
+  add_default_solver(gap=0) %>%
+
+  #Add binary decisions of either selecting or not selecting planning units
+  add_binary_decisions()
+
+#Solve the conservation planning problem
+s1<-solve(p1)
+
+#Create a vector for colouring the planning units
+colorvector<-ifelse(s1$solution_1==1,"blue",NA)
+
+#Plot the solution
+plot(st_geometry(study_area_utm),col = "grey50", bg = "light blue", axes = TRUE, cex = 20)
+text(bb["xmax"], bb["ymax"]*.99, paste0("Study Area:\n",study_area_utm$NAME_1))
+plot(st_geometry(hex_grid), col=colorvector,border = "orange",add=T)
+legend(bb["xmax"]*.99, bb["ymax"]*.87, legend=c("Not selected", "Selected"),
+       fill=c(NA, "blue"),  cex=0.8,bg=NA)
+```
+<br>
+
+The map shows which planning units are selected for management in the prioritisation solution.
+
+We can evaluate the performance of the solution to see, for example, how many planning units are selected, what the total cost is, how well conservation features are captured in the solution.
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE}
+
+#Calculate planning unit number statistic
+eval_n_summary(p1, data.frame(s1$solution_1))
+
+#Calculate cost statistic
+eval_cost_summary(p1, data.frame(s1$solution_1))
+
+#Plot showing proportion of species ranges protected
+featureSUM<-eval_feature_representation_summary(p1, data.frame(s1$solution_1)) %>% data.frame()
+barplot(featureSUM$relative_held, names.arg=rownames(featureSUM),horiz=TRUE,las=2,xlab="Proportion protected")
+abline(v = 0.3, col = "red")
+
+```
+<br>
+
+## 4.2. Other objectives
+
+There are many other objectives which can be used, these are described in full [here](https://cran.r-project.org/web/packages/prioritizr/vignettes/package_overview.html)
+
+
+* **Maximum cover objective:** Represent at least one instance of as many features as possible within a given budget.
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_max_cover_objective(budget = X)
+```
+<br>
+
+* **Maximum features objective:** Fulfill as many targets as possible while ensuring that the cost of the solution does not exceed a budget.
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_max_features_objective(budget = X)
+```
+<br>
+
+
+
+* **Minimum shortfall objective:** Minimise the overall (weighted sum) shortfall for as many targets as possible while ensuring that the cost of the solution does not exceed a budget.
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_min_shortfall_objective(budget = X)
+```
+<br>
+
+* **Minimum largest shortfall objective:** Minimise the largest (maximum) shortfall while ensuring that the cost of the solution does not exceed a budget.
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_min_largest_shortfall_objective(budget = X)
+```
+<br>
+
+* **Maximum phylogenetic diversity objective:** Maximize the phylogenetic diversity of the features represented in the solution subject to a budget.
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_max_phylo_div_objective(budget = X,tree = Y)
+```
+<br>
+
+* **Maximum phylogenetic endemism objective:** Maximize the phylogenetic endemism of the features represented in the solution subject to a budget.
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_max_phylo_end_objective(budget = X,tree = Y)
+```
+<br>
+
+* **Maximum utility objective:** Secure as much of the features as possible without exceeding a budget.
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_max_utility_objective(budget = X)
+```
+<br>
+
+## 4.3. Target setting
+
+Targets specify the minimum amount or proportion of a feature’s distribution that needs to be protected in the solution. Not all objectives need or can be combined with targets. Different targets can be set for different features.
+
+* **Absolute targets:** The total amount of each feature in the study area that needs to be secured.
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_min_set_objective() %>% add_absolute_targets(X)
+```
+<br>
+
+* **Relative targets:** The proportion of each feature in the study area that needs to be secured.
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_min_set_objective() %>% add_relative_targets(0.3)
+```
+<br>
+
+* **Log-linear targets:** Targets are expressed using scaling factors and log-linear interpolation.
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_min_set_objective() %>% add_loglinear_targets(X)
+```
+<br>
+
+## 4.4. Adding constraints
+
+Constraints can be added so that solutions exhibit a specific property. Constraints are binding and cannot be overridden.
+
+* **Locked in constraints:** Certain planning units are selected in the solution from the start and kept in as solutions. Protected areas might be locked in.
+
+In the Aceh example, we could lock in all Protected Areas listed in https://www.protectedplanet.net/. 'wdpa aceh.zip' contains the Protected Areas in Aceh and can be found  [here](https://github.com/dominicmuenzel/Prioritizr-rmarkdown/blob/main/wdpa aceh.zip).
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide'}
+
+#Load protected area shapefile
+unzip("wdpa aceh.zip")
+pas <- read_sf(dsn = ".", layer = "wdpa aceh" )
+pas <- st_transform(pas, st_crs(hex_grid))
+
+#Get the IDs of the planning units which are overlapping with Protected Areas. In this case we are assuming a hexagon with only a partial overlap is completely protected, but in a real world example you would probably cut the hexagon into pieces.
+overlap<-st_intersection(hex_grid,pas) %>% st_drop_geometry() %>% dplyr::select("ID") %>% unname() %>% unlist ()%>% as.numeric() %>% unique()
+
+
+#Add locked in constraints to the problem
+p1_lck <- p1 %>% add_locked_in_constraints(locked_in=overlap)
+
+#Solve the conservation planning problem
+s1_lck<-solve(p1_lck)
+
+```
+
+### {.tabset}
+
+#### Solution with locked in areas
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide',echo=FALSE}
+#Create a vector for colouring the planning units
+colorvector<-ifelse(s1_lck$solution_1==1,"blue",NA)
+
+#Plot the solution and protected areas
+plot(st_geometry(study_area_utm),col = "grey50", bg = "light blue", axes = TRUE, cex = 20)
+text(bb["xmax"], bb["ymax"]*.99, paste0("Study Area:\n",study_area_utm$NAME_1))
+plot(st_geometry(hex_grid), col=colorvector,border = "orange",add=T)
+plot(st_geometry(pas), border= "limegreen",col=NA,add=T)
+legend(bb["xmax"]*.99, bb["ymax"]*.87, legend=c("Not selected", "Selected","Protected Area"),
+       fill=c(NA, "blue","limegreen"),  cex=0.8,bg=NA)
+```
+
+#### Original solution without locked in areas
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide',echo=FALSE}
+#Create a vector for colouring the planning units
+colorvector<-ifelse(s1$solution_1==1,"blue",NA)
+
+#Plot the solution and protected areas
+plot(st_geometry(study_area_utm),col = "grey50", bg = "light blue", axes = TRUE, cex = 20)
+text(bb["xmax"], bb["ymax"]*.99, paste0("Study Area:\n",study_area_utm$NAME_1))
+plot(st_geometry(hex_grid), col=colorvector,border = "orange",add=T)
+legend(bb["xmax"]*.99, bb["ymax"]*.87, legend=c("Not selected", "Selected"),
+       fill=c(NA, "blue"),  cex=0.8,bg=NA)
+```
+
+
+### {-}
+
+We can see that all planning units overlapping with protected areas are selected in the solution. However, as some targets are still not met with just protected areas, two additional planning units are also selected.
+
+If you re-run the evaluation (see 4.1.) you can compare how many planning units are selected, the cost of the solution, and what proportion of species ranges are protected.
+
+<br>
+
+* **Locked out constraints:** Certain planning units are never selected in the solution, for example areas which are not suitable (e.g. civil infrastructure) or highly degraded.
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_locked_out_constraints(X)
+```
+<br>
+
+* **Neighbour constraints:** Ensure that all selected planning units have at least a certain number of neighbors.
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_neighbor_constraints(X)
+```
+<br>
+
+* **Contiguity constraints:** Ensure that all selected planning units are spatially connected to each other and form spatially contiguous unit.
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>%  add_contiguity_constraints()
+```
+<br>
+
+* **Feature contiguity constraints:** Ensure that each feature is represented in a contiguous unit of dispersible habitat.
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_feature_contiguity_constraints()
+```
+<br>
+
+* **Linear constraints:** Ensure that all selected planning units meet certain criteria. For example, they can be used to add multiple budgets, or limit the number of planning units selected in different administrative areas within a study region (e.g., different countries).
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_linear_constraints()
+```
+<br>
+
+* **Mandatory allocation constraints:** Ensure that every planning unit is allocated to a management zone in the solution.
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_mandatory_allocation_constraints()
+```
+<br>
+
+## 4.5. Adding penalties
+
+We can also add penalties to a problem to favour or penalise solutions according to a secondary objective. Unlike the constraint functions, these functions add extra information to the objective function of the optimisation function to penalise solutions that do not exhibit specific characteristics.
+
+* **Boundary penalties:** Add penalties to penalise solutions that are excessively fragmented.
+
+In the Aceh example, we could calculate the shared boundaries between hexagons as well as the total perimeter of each planning unit and create a more spatially aggregated solution. We store this information in **boundDF** which contains three columns: ID from, ID to, and boundary length.
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide'}
+
+
+
+#Get a list of touching borders
+Touching_List <- st_touches(hex_grid)
+
+#Get lines of intersection
+all.lines<-st_intersection(hex_grid,hex_grid)
+
+#Measure length of lines
+all.l_lines<-st_length(all.lines)
+
+#Create a boundary data frame. Since st_length calculates in metres, here we change to kilometres.
+boundDF<-data.frame("id1"=as.numeric(all.lines$ID),"id2"=as.numeric(all.lines$ID.1),"boundary"=as.numeric(all.l_lines)/1e3)
+
+#Calculate the perimeter of each hexagon, also changed to km.
+perimeters<-data.frame("ID"=hex_grid$ID,"perimeter"=as.numeric(st_perimeter(hex_grid))/1e3)
+
+#Replace the boundary of a hexagon to itself in boundDF with the newly calculated perimeters. This step is necessary as otherwise the boundaries of a hexagon to itself is 0.
+boundDF$boundary[which(boundDF$id1==boundDF$id2)]<-perimeters$perimeter[match(boundDF$id1[which(boundDF$id1==boundDF$id2)],perimeters$ID)]
+
+#Add boundary penalty to the problem
+p1_bnd <- p1 %>% add_boundary_penalties(penalty=1,data=boundDF)
+
+#Solve the conservation planning problem
+s1_bnd<-solve(p1_bnd)
+
+
+
+```
+<br>
+
+### {.tabset}
+
+#### Solution with boundary penalty
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide',echo=FALSE}
+#Create a vector for colouring the planning units
+colorvector<-ifelse(s1_bnd$solution_1==1,"blue",NA)
+
+#Plot the solution and protected areas
+plot(st_geometry(study_area_utm),col = "grey50", bg = "light blue", axes = TRUE, cex = 20)
+text(bb["xmax"], bb["ymax"]*.99, paste0("Study Area:\n",study_area_utm$NAME_1))
+plot(st_geometry(hex_grid), col=colorvector,border = "orange",add=T)
+legend(bb["xmax"]*.99, bb["ymax"]*.87, legend=c("Not selected", "Selected"),fill=c(NA, "blue"),  cex=0.8,bg=NA)
+```
+
+#### Solution with locked in areas
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide',echo=FALSE}
+#Create a vector for colouring the planning units
+colorvector<-ifelse(s1_lck$solution_1==1,"blue",NA)
+
+#Plot the solution and protected areas
+plot(st_geometry(study_area_utm),col = "grey50", bg = "light blue", axes = TRUE, cex = 20)
+text(bb["xmax"], bb["ymax"]*.99, paste0("Study Area:\n",study_area_utm$NAME_1))
+plot(st_geometry(hex_grid), col=colorvector,border = "orange",add=T)
+plot(st_geometry(pas), border= "limegreen",col=NA,add=T)
+legend(bb["xmax"]*.99, bb["ymax"]*.87, legend=c("Not selected", "Selected","Protected Area"),fill=c(NA, "blue","limegreen"),  cex=0.8,bg=NA)
+```
+
+#### Original solution without locked in areas
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide',echo=FALSE}
+#Create a vector for colouring the planning units
+colorvector<-ifelse(s1$solution_1==1,"blue",NA)
+
+#Plot the solution and protected areas
+plot(st_geometry(study_area_utm),col = "grey50", bg = "light blue", axes = TRUE, cex = 20)
+text(bb["xmax"], bb["ymax"]*.99, paste0("Study Area:\n",study_area_utm$NAME_1))
+plot(st_geometry(hex_grid), col=colorvector,border = "orange",add=T)
+legend(bb["xmax"]*.99, bb["ymax"]*.87, legend=c("Not selected", "Selected"), fill=c(NA, "blue"),  cex=0.8,bg=NA)
+```
+
+
+### {-}
+
+
+* **Connectivity penalties:** Add penalties to favour solutions that select combinations of planning units with high connectivity between them. Connectivity is quantified as symmetric connectivity in a square matrix giving strength of pairwise connections.
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_connectivity_penalties(penalty=X,data=Y)
+```
+<br>
+
+* **Asymmetric connectivity penalties:** As above but using asymmetric connectivity.
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_asym_connectivity_penalties(penalty=X,data=Y)
+```
+<br>
+
+* **Linear penalties:** Add penalties to penalise solutions that select planning units according to a certain variable (e.g., anthropogenic pressure).
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>%  add_linear_penalties(penalty=X,data=Y)
+```
+<br>
+
+## 4.6. Decision types
+
+Conservation planning problems involve allocating management actions to specific planning units, e.g., turning a planning unit into a protected area.
+
+
+* **Binary decisions:** Add a binary decision to a conservation planning problem.
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_binary_decisions()
+```
+<br>
+
+
+* **Proportion decisions:** Add a proportion decision to a problem. This is a relaxed decision where a part of a planning unit can be prioritized, as opposed to the default of the entire planning unit.
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_proportion_decisions()
+```
+<br>
+
+* **Semi-continuous decisions:** Add a semi-continuous decision to a problem. This decision is similar to proportion decisions except that it has an upper bound parameter.
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_semicontinuous_decisions()
+```
+<br>
+
+## 4.7. Add a solver
+
+Prioritizr can use many different algorithm solvers, some are faster than others, some are free and some are not.
+
+With an academic e-mail you can use Gurobi for free (the fastest one). https://www.gurobi.com/
+
+## 4.8. Add a portfolio (only possible with Gurobi)
+
+Until now we have only generated a single optimal solution. In some cases, it may instead be desirable to produce a range of near-optimal solutions. This can give decision-makers options and show which areas tend to be relatively important as they are often selected across solutions.
+
+* **Gap portfolio:** Generate a portfolio of solutions by finding a certain number of solutions that are all within a pre-specified optimality gap.
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide'}
+
+#Create 5 solutions which are within 10% optimality
+p1_prt <- p1 %>% add_gap_portfolio(number_solutions = 5, pool_gap = 0.1)
+
+#Solve the conservation planning problem
+s1_prt<-solve(p1_prt)
+
+```
+<br>
+
+### {.tabset}
+
+#### Solution with portfolio
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide',echo=FALSE}
+
+colorvector<-rowSums(s1_prt[,3:7])
+
+colorvector<-recode(colorvector,"0"=NULL,
+                    "1"="#CCCCFF" ,
+                    "2"="#9999FF" ,
+                    "3"="#6565FF",
+                    "4"="#3232FF",
+                    "5"="#0000FF")
+
+
+#Plot the Aceh shapefile and planning unit grid
+plot(st_geometry(study_area_utm),col = "grey50", bg = "light blue", axes = TRUE, cex = 20)
+text(bb["xmax"], bb["ymax"]*.99, paste0("Study Area:\n",study_area_utm$NAME_1))
+plot(st_geometry(hex_grid), col=colorvector,border = "orange",add=T)
+legend(bb["xmax"]*.99, bb["ymax"]*.92, legend=c("Not selected", "Selected 1x", "Selected 2x", "Selected 3x", "Selected 4x", "Selected 5x"),fill=c(NA, "#CCCCFF", "#9999FF", "#6565FF", "#3232FF", "#0000FF"),  cex=0.8,bg=NA)
+
+```
+
+#### Solution with boundary penalty
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide',echo=FALSE}
+#Create a vector for colouring the planning units
+colorvector<-ifelse(s1_bnd$solution_1==1,"blue",NA)
+
+#Plot the solution and protected areas
+plot(st_geometry(study_area_utm),col = "grey50", bg = "light blue", axes = TRUE, cex = 20)
+text(bb["xmax"], bb["ymax"]*.99, paste0("Study Area:\n",study_area_utm$NAME_1))
+plot(st_geometry(hex_grid), col=colorvector,border = "orange",add=T)
+legend(bb["xmax"]*.99, bb["ymax"]*.87, legend=c("Not selected", "Selected"),fill=c(NA, "blue"),  cex=0.8,bg=NA)
+```
+
+#### Solution with locked in areas
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide',echo=FALSE}
+#Create a vector for colouring the planning units
+colorvector<-ifelse(s1_lck$solution_1==1,"blue",NA)
+
+#Plot the solution and protected areas
+plot(st_geometry(study_area_utm),col = "grey50", bg = "light blue", axes = TRUE, cex = 20)
+text(bb["xmax"], bb["ymax"]*.99, paste0("Study Area:\n",study_area_utm$NAME_1))
+plot(st_geometry(hex_grid), col=colorvector,border = "orange",add=T)
+plot(st_geometry(pas), border= "limegreen",col=NA,add=T)
+legend(bb["xmax"]*.99, bb["ymax"]*.87, legend=c("Not selected", "Selected","Protected Area"),fill=c(NA, "blue","limegreen"),  cex=0.8,bg=NA)
+```
+
+#### Original solution without locked in areas
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide',echo=FALSE}
+#Create a vector for colouring the planning units
+colorvector<-ifelse(s1$solution_1==1,"blue",NA)
+
+#Plot the solution and protected areas
+plot(st_geometry(study_area_utm),col = "grey50", bg = "light blue", axes = TRUE, cex = 20)
+text(bb["xmax"], bb["ymax"]*.99, paste0("Study Area:\n",study_area_utm$NAME_1))
+plot(st_geometry(hex_grid), col=colorvector,border = "orange",add=T)
+legend(bb["xmax"]*.99, bb["ymax"]*.87, legend=c("Not selected", "Selected"), fill=c(NA, "blue"),  cex=0.8,bg=NA)
+```
+
+### {-}
+
+* **Top portfolio:** Generate a portfolio of solutions by finding a pre-specified number of solutions that are closest to optimality (i.e the top solutions).
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_extra_portfolio()
+```
+<br>
+
+* **Cuts portfolio:** Generate a portfolio of distinct solutions within a pre-specified optimality gap.
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_cuts_portfolio()
+```
+<br>
+
+* **Shuffle portfolio:** Generate a portfolio of solutions by randomly reordering the data prior to attempting to solve the problem.
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_shuffle_portfolio()
+```
+<br>
+
+## 4.9. Adding feature weights
+
+Some objective functions aim to maximise or minimise a metric that measures how well a set of features are represented by a solution (e.g. maximum features objective, minimum shortfall objective). It may be desirable to prefer the representation of some features over others, for example those that have higher extinction risk.
+
+We can add weights to specify how much more important it is for a solution to represent particular features compared with other features.
+
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+problem() %>% add_feature_weights(X)
+```
+<br>
+
+# 5. Evaluating the solution
+
+## 5.1. Evaluating performance
+
+In section 4.1. we already looked at some performance evaluations, including total number of planning units in the solution, total cost, and feature representation. There are some others which may be informative.
+
+* **Boundary summary:** Calculate the total exposed boundary length (perimeter) associated with a solution.
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE}
+
+# calculate total boundary statistic
+eval_boundary_summary(p1_bnd, data.frame(s1_bnd$solution_1),data=boundDF)
+
+```
+<br>
+
+
+* **Connectivity summary:** Calculate the connectivity of a solution using symmetric connectivity data.
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+
+#calculate total connectivity, data supplied is a connectivity adjacency matrix
+eval_connectivity_summary(problem, solution, data = X)
+```
+<br>
+
+
+* **Asymmetric connectivity summary:** As above but for asymmetric connectivity.
+
+```{r, warning=FALSE,message=FALSE,eval=FALSE,results='hide'}
+
+#calculate total connectivity, data supplied is a connectivity adjacency matrix
+eval_asym_connectivity_summary(problem, solution, data = X)
+```
+<br>
+
+## 5.2. Evaluating relative importance
+
+Not all planning units that are selected in a solution are equally important. Some may be more irreplaceable or contain more rare features. If we rank their importance, we can inform management scheduling if, for example, resources are limited and the entire solution cannot be allocated at once.
+
+Importance can be quantified in different ways.
+
+* **Replacement cost:** Quantify the importance of a given planning unit as the decrease in the performance of the solution if the planning unit cannot be acquired.
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide'}
+
+#calculate replacement cost scores
+p1_rplc <- p1 %>%  eval_replacement_importance(data.frame(s1$solution_1))
+
+```
+<br>
+
+* **Ferrier method:** Evaluate importance by computing irreplaceability scores following Ferrier et al.
+https://doi.org/10.1016/S0006-3207(99)00149-4
+
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide'}
+
+#calculate irreplaceability scores
+p1_frr <- eval_ferrier_importance(p1,data.frame(s1$solution_1))[["total"]]
+
+```
+<br>
+
+* **Rarity weighted richness:** Evaluate importance by computing rarity weighted richness scores
+https://www.jstor.org/stable/2386953
+
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide'}
+
+#calculate rarity weighted richness scores
+p1_rwr <- eval_rare_richness_importance(p1,data.frame(s1$solution_1))
+
+```
+<br>
+
+### {.tabset}
+
+#### Replacement cost
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide',echo=FALSE}
+
+# color gradient
+n=10
+pal <- rev(brewer.pal(n, "Spectral"))
+int=classIntervals(p1_rplc$rc,n)
+colorvector=pal[findInterval(p1_rplc$rc,seq(from=0,to=max(p1_rplc$rc),length.out=10),all.inside = T)]
+
+#Plot the Aceh shapefile and planning unit grid
+plot(st_geometry(study_area_utm),col = "grey50", bg = "light blue", axes = TRUE, cex = 20)
+text(bb["xmax"], bb["ymax"]*.99, paste0("Study Area:\n",study_area_utm$NAME_1))
+plot(st_geometry(hex_grid), col=colorvector,border = "orange",add=T)
+gradientLegend(c(0,max(p1_rplc$rc)),pal,pos=c(.95,.1,.9,.9))
+
+```
+
+#### Ferrier irreplaceability
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide',echo=FALSE}
+# color gradient
+n=10
+pal <- rev(brewer.pal(n, "Spectral"))
+int=classIntervals(p1_frr,n)
+colorvector=pal[findInterval(p1_frr,seq(from=0,to=max(p1_frr),length.out=10),all.inside = T)]
+
+#Plot the Aceh shapefile and planning unit grid
+plot(st_geometry(study_area_utm),col = "grey50", bg = "light blue", axes = TRUE, cex = 20)
+text(bb["xmax"], bb["ymax"]*.99, paste0("Study Area:\n",study_area_utm$NAME_1))
+plot(st_geometry(hex_grid), col=colorvector,border = "orange",add=T)
+gradientLegend(c(0,max(p1_frr)),pal,pos=c(.95,.1,.9,.9))
+```
+
+#### Rarity weighted richness
+
+```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide',echo=FALSE}
+# color gradient
+n=10
+pal <- rev(brewer.pal(n, "Spectral"))
+int=classIntervals(p1_rwr$rwr,n)
+colorvector=pal[findInterval(p1_rwr$rwr,seq(from=0,to=max(p1_rwr$rwr),length.out=10),all.inside = T)]
+
+#Plot the Aceh shapefile and planning unit grid
+plot(st_geometry(study_area_utm),col = "grey50", bg = "light blue", axes = TRUE, cex = 20)
+text(bb["xmax"], bb["ymax"]*.99, paste0("Study Area:\n",study_area_utm$NAME_1))
+plot(st_geometry(hex_grid), col=colorvector,border = "orange",add=T)
+gradientLegend(c(0,max(p1_rwr$rwr)),pal,pos=c(.95,.1,.9,.9))
+```
+
+
+### {-}
+
+
+
+
+# 6. Other useful resources
+
+Calibrating trade-offs tutorial https://cran.r-project.org/web/packages/prioritizr/vignettes/calibrating_trade-offs_tutorial.html
+
+Connectivity tutorial https://cran.r-project.org/web/packages/prioritizr/vignettes/connectivity_tutorial.html
+
+Gurobi installation guide https://cran.r-project.org/web/packages/prioritizr/vignettes/gurobi_installation_guide.html
+
+Management zones tutorial https://cran.r-project.org/web/packages/prioritizr/vignettes/management_zones_tutorial.html
+
+Package overview https://cran.r-project.org/web/packages/prioritizr/vignettes/package_overview.html
+
+Getting started https://cran.r-project.org/web/packages/prioritizr/vignettes/prioritizr.html
+
+Publication record https://cran.r-project.org/web/packages/prioritizr/vignettes/publication_record.html
+
+Solver benchmarks https://cran.r-project.org/web/packages/prioritizr/vignettes/solver_benchmarks.html
