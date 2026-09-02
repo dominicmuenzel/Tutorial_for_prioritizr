@@ -45,7 +45,7 @@ library(classInt)
 
 # 2. Setting up study area and planning unit grid
 
-In this example, our planning region will be Aceh, Indonesia. This file can be found [here](https://github.com/dominicmuenzel/Prioritizr-rmarkdown/blob/main/study_area_utm.zip).
+In this example, our planning region will be Aceh, Indonesia. This file can be found [here](https://github.com/dominicmuenzel/Tutorial_for_prioritizr/blob/main/study_area_utm.zip).
 
 ```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide'}
 
@@ -132,7 +132,7 @@ In this case our planning unit grid is a shapefile, but *prioritizr* also accept
 
 Now we will import some example conservation feature data.
 
-'animals.zip' contains the species ranges for nine species of terrestrial mammals from the IUCN Red List database and can be found [here](https://github.com/dominicmuenzel/Prioritizr-rmarkdown/blob/main/animals.zip).
+'animals.zip' contains the species ranges for nine species of terrestrial mammals from the IUCN Red List database and can be found [here](https://github.com/dominicmuenzel/Tutorial_for_prioritizr/blob/main/animals.zip).
 
 Conservation features can also be habitat types, ecosystem services, or landscape metrics (e.g. connectivity). They can be presence-absence or continuous data. There is no limit as to how many conservation features can be included in a problem.
 
@@ -329,7 +329,7 @@ Constraints can be added so that solutions exhibit a specific property. Constrai
 
 * **Locked in constraints:** Certain planning units are selected in the solution from the start and kept in as solutions. Protected areas might be locked in.
 
-In the Aceh example, we could lock in all Protected Areas listed in https://www.protectedplanet.net/. 'wdpa aceh.zip' contains the Protected Areas in Aceh and can be found  [here](https://github.com/dominicmuenzel/Prioritizr-rmarkdown/blob/main/wdpa aceh.zip).
+In the Aceh example, we could lock in all Protected Areas listed in https://www.protectedplanet.net/. 'wdpa aceh.zip' contains the Protected Areas in Aceh and can be found  [here](https://github.com/dominicmuenzel/Tutorial_for_prioritizr/blob/main/wdpa aceh.zip).
 
 ```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide'}
 
@@ -573,7 +573,7 @@ Prioritizr can use many different algorithm solvers, some are faster than others
 
 With an academic e-mail you can use Gurobi for free (the fastest one). https://www.gurobi.com/
 
-## 4.8. Add a portfolio (only possible with Gurobi)
+## 4.8. Add a portfolio 
 
 Until now we have only generated a single optimal solution. In some cases, it may instead be desirable to produce a range of near-optimal solutions. This can give decision-makers options and show which areas tend to be relatively important as they are often selected across solutions.
 
@@ -582,7 +582,7 @@ Until now we have only generated a single optimal solution. In some cases, it ma
 ```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide'}
 
 #Create 5 solutions which are within 10% optimality
-p1_prt <- p1 %>% add_gap_portfolio(number_solutions = 5, pool_gap = 0.1)
+p1_prt <- p1 %>% add_shuffle_portfolio(number_solutions = 5)
 
 #Solve the conservation planning problem
 s1_prt<-solve(p1_prt)
@@ -596,7 +596,7 @@ s1_prt<-solve(p1_prt)
 
 ```{r, warning=FALSE,message=FALSE,eval=TRUE,results='hide',echo=FALSE}
 
-colorvector<-rowSums(s1_prt[,3:7])
+colorvector<-rowSums(s1_prt[,3:ncol(s1_prt)])
 
 colorvector<-recode(colorvector,"0"=NULL,
                     "1"="#CCCCFF" ,
@@ -699,8 +699,11 @@ In section 4.1. we already looked at some performance evaluations, including tot
 
 ```{r, warning=FALSE,message=FALSE,eval=TRUE}
 
+# convert the long-format boundary data.frame into a proper sparse matrix
+bmat <- marxan_boundary_data_to_matrix(p1_bnd, boundDF)
+
 # calculate total boundary statistic
-eval_boundary_summary(p1_bnd, data.frame(s1_bnd$solution_1),data=boundDF)
+eval_boundary_summary(p1_bnd, data.frame(s1_bnd$solution_1),data=bmat)
 
 ```
 <br>
